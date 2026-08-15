@@ -231,12 +231,21 @@ jobs:
       - name: Test application
         shell: bash
         run: |
+          set -euo pipefail
+
           SERVICE="$(
             kubectl get service \
               --namespace ping-pong \
               -l app.kubernetes.io/instance=ping-pong \
               -o jsonpath='{.items[0].metadata.name}'
           )"
+
+          if [ -z "${SERVICE}" ]; then
+            echo "Application service was not found"
+            exit 1
+          fi
+
+          echo "Using service: ${SERVICE}"
 
           kubectl port-forward \
             --namespace ping-pong \
@@ -246,24 +255,44 @@ jobs:
 
           PORT_FORWARD_PID=$!
 
-          trap 'kill ${PORT_FORWARD_PID} || true' EXIT
+          trap 'kill ${PORT_FORWARD_PID} 2>/dev/null || true' EXIT
 
-          for i in {1..20}; do
-            if curl -fsS http://127.0.0.1:18080/health > /dev/null; then
+          echo "Waiting for application to become reachable..."
+
+          READY=false
+
+          for i in {1..30}; do
+            if curl -fsS \
+              http://127.0.0.1:18080/health \
+              > /dev/null 2>&1; then
+
+              READY=true
               break
             fi
 
             sleep 1
           done
 
-          echo "Testing health endpoint"
+          if [ "${READY}" != "true" ]; then
+            echo "Application did not become reachable"
+            echo "Port-forward logs:"
+            cat /tmp/port-forward.log || true
+            exit 1
+          fi
+
+          echo "Application is reachable"
+
+          echo "Testing health endpoint..."
 
           curl -fsS \
             http://127.0.0.1:18080/health \
-            | jq -e '.status == "healthy"'
+            | jq -e '.status == "healthy"' \
+            > /dev/null
+
+          echo "Health check passed"
 
 
-          echo "Testing unauthenticated request"
+          echo "Testing unauthenticated /ping..."
 
           STATUS="$(
             curl \
@@ -273,13 +302,34 @@ jobs:
               http://127.0.0.1:18080/ping
           )"
 
-          test "$STATUS" = "401"
+          if [ "${STATUS}" != "401" ]; then
+            echo "Expected HTTP 401, received ${STATUS}"
+            exit 1
+          fi
+
+          echo "Unauthenticated request correctly returned 401"
 
 
-          echo "Testing authenticated ping"
+          echo "Testing authenticated /ping..."
 
-          curl \
-            -fsS \
+          curl -fsS \
             -H "Authorization: Bearer ${TEST_TOKEN}" \
             http://127.0.0.1:18080/ping \
-            | jq -e '.message == "pong"'
+            | jq -e '.message == "pong"' \
+            > /dev/null
+
+          echo "Authenticated /ping returned pong"
+
+
+          echo "Testing authenticated /pong..."
+
+          curl -fsS \
+            -H "Authorization: Bearer ${TEST_TOKEN}" \
+            http://127.0.0.1:18080/pong \
+            | jq -e '.message == "ping"' \
+            > /dev/null
+
+          echo "Authenticated /pong returned ping"
+
+
+          echo "All application smoke tests passed"
