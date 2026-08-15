@@ -1,0 +1,395 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24.13"
+  GOTOOLCHAIN: local
+  HELM_CHART: .k8s/helm/ping-pong
+
+jobs:
+
+  # ============================================================
+  # Validate release tag + source
+  # ============================================================
+
+  validation:
+    name: Release Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate SemVer tag
+        shell: bash
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: ${GITHUB_REF_NAME}"
+            echo "Expected format: vMAJOR.MINOR.PATCH (example: v1.0.0)"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+
+          if [ -n "$files" ]; then
+            echo "The following files are not formatted:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Verify application build
+        run: |
+          CGO_ENABLED=0 \
+          go build \
+            -mod=readonly \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o /tmp/ping-pong-app \
+            .
+
+      - name: Helm lint
+        run: |
+          helm lint "${HELM_CHART}"
+
+      - name: Render Helm manifests
+        run: |
+          helm template ping-pong "${HELM_CHART}" \
+            --namespace ping-pong \
+            > rendered-manifests.yaml
+
+      - name: Scan Kubernetes manifests
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: rendered-manifests.yaml
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Scan repository for secrets
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          exit-code: "1"
+
+
+  # ============================================================
+  # Build + scan exact container images
+  # ============================================================
+
+  image-security:
+    name: Release Image - ${{ matrix.arch }}
+
+    needs:
+      - validation
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        arch:
+          - amd64
+          - arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Generate build timestamp
+        id: metadata
+        run: |
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build release image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+
+          platforms: linux/${{ matrix.arch }}
+
+          load: true
+          push: false
+
+          tags: ping-pong:release-${{ matrix.arch }}
+
+          provenance: false
+
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+
+          image-ref: ping-pong:release-${{ matrix.arch }}
+
+          format: table
+          vuln-type: os,library
+
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+
+          exit-code: "1"
+          timeout: 10m
+
+      # Important:
+      # This happens only AFTER Trivy succeeds.
+      - name: Save scanned image
+        run: |
+          docker save \
+            ping-pong:release-${{ matrix.arch }} \
+            -o ping-pong-${{ matrix.arch }}.tar
+
+      - name: Upload scanned image
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.arch }}
+          path: ping-pong-${{ matrix.arch }}.tar
+          if-no-files-found: error
+          retention-days: 1
+
+
+  # ============================================================
+  # Build binary releases
+  # ============================================================
+
+  build-binaries:
+    name: Binary - ${{ matrix.arch }}
+
+    needs:
+      - image-security
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        arch:
+          - amd64
+          - arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build binary
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          BINARY="ping-pong-app-linux-${{ matrix.arch }}"
+
+          CGO_ENABLED=0 \
+          GOOS=linux \
+          GOARCH=${{ matrix.arch }} \
+          go build \
+            -mod=readonly \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "dist/${BINARY}" \
+            .
+
+          tar \
+            -C dist \
+            -czf "dist/${BINARY}.tar.gz" \
+            "${BINARY}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+
+  # ============================================================
+  # Publish the EXACT scanned images
+  # ============================================================
+
+  publish-image:
+    name: Publish Multi-Arch Image
+
+    needs:
+      - image-security
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download amd64 image
+        uses: actions/download-artifact@v8
+        with:
+          name: image-amd64
+          path: images/amd64
+
+      - name: Download arm64 image
+        uses: actions/download-artifact@v8
+        with:
+          name: image-arm64
+          path: images/arm64
+
+      - name: Load scanned images
+        run: |
+          docker load \
+            -i images/amd64/ping-pong-amd64.tar
+
+          docker load \
+            -i images/arm64/ping-pong-arm64.tar
+
+      - name: Generate image name
+        id: image
+        shell: bash
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          echo "name=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push architecture images
+        shell: bash
+        run: |
+          IMAGE="${{ steps.image.outputs.name }}"
+          VERSION="${GITHUB_REF_NAME}"
+
+          docker tag \
+            ping-pong:release-amd64 \
+            "${IMAGE}:${VERSION}-amd64"
+
+          docker tag \
+            ping-pong:release-arm64 \
+            "${IMAGE}:${VERSION}-arm64"
+
+          docker push "${IMAGE}:${VERSION}-amd64"
+          docker push "${IMAGE}:${VERSION}-arm64"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create multi-architecture image
+        shell: bash
+        run: |
+          IMAGE="${{ steps.image.outputs.name }}"
+          VERSION="${GITHUB_REF_NAME}"
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:sha-${GITHUB_SHA}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+      - name: Verify multi-architecture image
+        shell: bash
+        run: |
+          docker buildx imagetools inspect \
+            "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}"
+            
+    # ============================================================
+  # GitHub binary release
+  # ============================================================
+
+  github-release:
+    name: GitHub Release
+
+    needs:
+      - build-binaries
+      - publish-image
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: release
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        shell: bash
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+
+            gh release upload \
+              "${GITHUB_REF_NAME}" \
+              release/*.tar.gz \
+              release/SHA256SUMS \
+              --clobber
+
+          else
+
+            gh release create \
+              "${GITHUB_REF_NAME}" \
+              release/*.tar.gz \
+              release/SHA256SUMS \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+
+          fi

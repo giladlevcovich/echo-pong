@@ -1,0 +1,11 @@
+apiVersion: v2
+
+name: ping-pong
+
+description: Helm chart for the Ping-Pong DevOps home assignment
+
+type: application
+
+version: 0.1.0
+
+appVersion: "dev"

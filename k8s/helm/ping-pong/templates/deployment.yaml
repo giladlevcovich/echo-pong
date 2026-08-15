@@ -1,0 +1,148 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: {{ include "ping-pong.fullname" . }}
+  labels:
+    {{- include "ping-pong.labels" . | nindent 4 }}
+
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+
+  revisionHistoryLimit: 5
+
+  strategy:
+    type: RollingUpdate
+
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  selector:
+    matchLabels:
+      {{- include "ping-pong.selectorLabels" . | nindent 6 }}
+
+  template:
+    metadata:
+      labels:
+        {{- include "ping-pong.selectorLabels" . | nindent 8 }}
+
+    spec:
+
+      automountServiceAccountToken: false
+
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.arm64.preferred }}
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - arm64
+      {{- end }}
+
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+
+          topologyKey: kubernetes.io/hostname
+
+          whenUnsatisfiable: ScheduleAnyway
+
+          labelSelector:
+            matchLabels:
+              {{- include "ping-pong.selectorLabels" . | nindent 14 }}
+      {{- end }}
+
+      containers:
+
+        - name: ping-pong
+
+          {{- if .Values.image.digest }}
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          {{- end }}
+
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          args:
+            - "--mode=server"
+
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+
+          env:
+            - name: PORT
+              value: {{ .Values.service.targetPort | quote }}
+
+            - name: SECRET_FILE_PATH
+              value: /run/secrets/ping-pong-secret
+
+          volumeMounts:
+            - name: secret
+              mountPath: /run/secrets
+              readOnly: true
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+      volumes:
+        - name: secret
+
+          secret:
+            secretName: ping-pong-secret
+
+            defaultMode: 0440
+
+            items:
+              - key: token
+                path: ping-pong-secret

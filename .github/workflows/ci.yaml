@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24.13"
+  GOTOOLCHAIN: local
+  HELM_CHART: .k8s/helm/ping-pong
+
+jobs:
+
+  # ============================================================
+  # Go validation
+  # ============================================================
+
+  go-ci:
+    name: Go CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+
+          if [ -n "$files" ]; then
+            echo "The following files are not formatted:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Build
+        run: |
+          CGO_ENABLED=0 \
+          go build \
+            -mod=readonly \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o /tmp/ping-pong-app \
+            .
+
+
+  # ============================================================
+  # Helm validation
+  # ============================================================
+
+  helm-validation:
+    name: Helm Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify Helm
+        run: helm version
+
+      - name: Helm lint
+        run: |
+          helm lint "${HELM_CHART}"
+
+      - name: Render Helm manifests
+        run: |
+          helm template ping-pong "${HELM_CHART}" \
+            --namespace ping-pong \
+            > rendered-manifests.yaml
+
+      - name: Scan Kubernetes manifests
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: rendered-manifests.yaml
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+
+  # ============================================================
+  # Secret scanning
+  # ============================================================
+
+  repository-security:
+    name: Repository Secret Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Scan repository for secrets
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          exit-code: "1"
+
+
+  # ============================================================
+  # Container security - both architectures
+  # ============================================================
+
+  image-security:
+    name: Image Security - ${{ matrix.arch }}
+
+    needs:
+      - go-ci
+      - helm-validation
+      - repository-security
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Generate build timestamp
+        id: metadata
+        run: |
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+
+          tags: ping-pong:ci-${{ matrix.arch }}
+
+          provenance: false
+
+          build-args: |
+            VERSION=ci
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ping-pong:ci-${{ matrix.arch }}
+          format: table
+          vuln-type: os,library
+
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+
+          exit-code: "1"
+          timeout: 10m
