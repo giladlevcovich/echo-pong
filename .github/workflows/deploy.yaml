@@ -15,7 +15,7 @@ permissions:
   packages: read
 
 env:
-  HELM_CHART: .k8s/helm/ping-pong
+  HELM_CHART: ./k8s/helm/ping-pong
 
 jobs:
 
