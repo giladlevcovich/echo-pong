@@ -3,7 +3,7 @@
 # ============================================================
 # Build stage
 # ============================================================
-FROM --platform=$BUILDPLATFORM golang:1.24.13-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm AS builder
 
 WORKDIR /src
 
