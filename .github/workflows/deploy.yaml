@@ -194,7 +194,6 @@ jobs:
 
       - name: Verify rollout
         shell: bash
-
         run: |
           DEPLOYMENT="$(
             kubectl get deployment \
@@ -231,7 +230,6 @@ jobs:
 
       - name: Test application
         shell: bash
-
         run: |
           SERVICE="$(
             kubectl get service \
