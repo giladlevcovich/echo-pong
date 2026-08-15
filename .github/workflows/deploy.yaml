@@ -1,0 +1,287 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      version:
+        description: "Release version to deploy (example: v1.0.0), or 'latest'"
+        required: true
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  HELM_CHART: .k8s/helm/ping-pong
+
+jobs:
+
+  deploy:
+    name: Deploy ${{ inputs.version }} to Kind
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ========================================================
+      # Resolve requested release
+      # ========================================================
+
+      - name: Resolve release version
+        id: release
+        shell: bash
+
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+          REQUESTED="${{ inputs.version }}"
+
+          if [ "$REQUESTED" = "latest" ]; then
+
+            VERSION="$(
+              gh release view \
+                --repo "${GITHUB_REPOSITORY}" \
+                --json tagName \
+                --jq '.tagName'
+            )"
+
+          else
+
+            VERSION="$REQUESTED"
+
+            # Make sure the selected version is actually
+            # an existing GitHub Release.
+            gh release view \
+              "$VERSION" \
+              --repo "${GITHUB_REPOSITORY}" \
+              > /dev/null
+          fi
+
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release version: $VERSION"
+            exit 1
+          fi
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+          echo "Deploying release: ${VERSION}"
+
+
+      # ========================================================
+      # Checkout the SAME Git tag
+      # ========================================================
+
+      - name: Checkout selected release
+        uses: actions/checkout@v7
+
+        with:
+          ref: ${{ steps.release.outputs.version }}
+
+
+      # ========================================================
+      # Create temporary Kubernetes cluster
+      # ========================================================
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.14.0
+
+        with:
+          version: v0.32.0
+          cluster_name: ping-pong-validation
+          wait: 120s
+
+
+      - name: Verify Kubernetes
+        run: |
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+
+      # ========================================================
+      # Pull the already-released image
+      # ========================================================
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+
+      - name: Pull selected release
+        shell: bash
+
+        run: |
+          docker pull \
+            "${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}"
+
+
+      - name: Load release into Kind
+        shell: bash
+
+        run: |
+          kind load docker-image \
+            "${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}" \
+            --name ping-pong-validation
+
+
+      # ========================================================
+      # Runtime secret
+      # ========================================================
+
+      - name: Create namespace
+        run: |
+          kubectl create namespace ping-pong \
+            --dry-run=client \
+            -o yaml \
+            | kubectl apply -f -
+
+
+      - name: Create temporary application secret
+        shell: bash
+
+        run: |
+          TEST_TOKEN="$(openssl rand -hex 24)"
+
+          echo "TEST_TOKEN=${TEST_TOKEN}" >> "$GITHUB_ENV"
+
+          kubectl \
+            --namespace ping-pong \
+            create secret generic ping-pong-secret \
+            --from-literal=token="${TEST_TOKEN}" \
+            --dry-run=client \
+            -o yaml \
+            | kubectl apply -f -
+
+
+      # ========================================================
+      # Helm deployment
+      # ========================================================
+
+      - name: Deploy with Helm
+        shell: bash
+
+        run: |
+          helm upgrade \
+            --install \
+            ping-pong \
+            "${HELM_CHART}" \
+            --namespace ping-pong \
+            --create-namespace \
+            --set-string image.repository="${{ steps.release.outputs.image }}" \
+            --set-string image.tag="${{ steps.release.outputs.version }}" \
+            --set-string image.digest="" \
+            --set image.pullPolicy=IfNotPresent \
+            --set autoscaling.enabled=false \
+            --set replicaCount=3 \
+            --atomic \
+            --wait \
+            --timeout 5m
+
+
+      # ========================================================
+      # Deployment verification
+      # ========================================================
+
+      - name: Verify rollout
+        shell: bash
+
+        run: |
+          DEPLOYMENT="$(
+            kubectl get deployment \
+              --namespace ping-pong \
+              -l app.kubernetes.io/instance=ping-pong \
+              -o jsonpath='{.items[0].metadata.name}'
+          )"
+
+          kubectl rollout status \
+            deployment/"${DEPLOYMENT}" \
+            --namespace ping-pong \
+            --timeout=180s
+
+
+      - name: Show Kubernetes resources
+        run: |
+          kubectl get pods \
+            --namespace ping-pong \
+            -o wide
+
+          kubectl get service \
+            --namespace ping-pong
+
+          kubectl get ingress \
+            --namespace ping-pong
+
+          kubectl get pdb \
+            --namespace ping-pong
+
+
+      # ========================================================
+      # Application smoke tests
+      # ========================================================
+
+      - name: Test application
+        shell: bash
+
+        run: |
+          SERVICE="$(
+            kubectl get service \
+              --namespace ping-pong \
+              -l app.kubernetes.io/instance=ping-pong \
+              -o jsonpath='{.items[0].metadata.name}'
+          )"
+
+          kubectl port-forward \
+            --namespace ping-pong \
+            service/"${SERVICE}" \
+            18080:80 \
+            > /tmp/port-forward.log 2>&1 &
+
+          PORT_FORWARD_PID=$!
+
+          trap 'kill ${PORT_FORWARD_PID} || true' EXIT
+
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:18080/health > /dev/null; then
+              break
+            fi
+
+            sleep 1
+          done
+
+          echo "Testing health endpoint"
+
+          curl -fsS \
+            http://127.0.0.1:18080/health \
+            | jq -e '.status == "healthy"'
+
+
+          echo "Testing unauthenticated request"
+
+          STATUS="$(
+            curl \
+              -s \
+              -o /dev/null \
+              -w "%{http_code}" \
+              http://127.0.0.1:18080/ping
+          )"
+
+          test "$STATUS" = "401"
+
+
+          echo "Testing authenticated ping"
+
+          curl \
+            -fsS \
+            -H "Authorization: Bearer ${TEST_TOKEN}" \
+            http://127.0.0.1:18080/ping \
+            | jq -e '.message == "pong"'
