@@ -6,7 +6,12 @@
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
-{{- printf "%s-%s" .Release.Name (include "ping-pong.name" .) | trunc 63 | trimSuffix "-" }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -26,13 +31,5 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- default (include "ping-pong.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
-{{- end }}
-{{- end }}
-
-{{- define "ping-pong.secretName" -}}
-{{- if .Values.secret.create }}
-{{- include "ping-pong.fullname" . }}
-{{- else }}
-{{- required "secret.existingSecret must be configured when secret.create=false" .Values.secret.existingSecret }}
 {{- end }}
 {{- end }}

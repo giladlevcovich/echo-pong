@@ -30,7 +30,6 @@ spec:
         {{- include "ping-pong.selectorLabels" . | nindent 8 }}
 
     spec:
-      serviceAccountName: {{ include "ping-pong.serviceAccountName" . }}
 
       automountServiceAccountToken: false
 
@@ -140,10 +139,10 @@ spec:
         - name: secret
 
           secret:
-            secretName: {{ include "ping-pong.secretName" . }}
+            secretName: ping-pong-secret
 
             defaultMode: 0440
 
             items:
-              - key: {{ .Values.secret.key }}
+              - key: token
                 path: ping-pong-secret
