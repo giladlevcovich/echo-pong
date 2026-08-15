@@ -7,31 +7,14 @@ FROM --platform=$BUILDPLATFORM golang:1.24.13-bookworm AS builder
 
 WORKDIR /src
 
-# Provided automatically by Docker BuildKit / Buildx
 ARG TARGETOS
 ARG TARGETARCH
 
-# Force the Go version bundled in the builder image.
-# Prevent Go from automatically switching/downloading another toolchain.
 ENV GOTOOLCHAIN=local
 
-# Copy module definition first.
-# This project currently has no external dependencies/go.sum.
 COPY go.mod ./
-
-# Copy application source
 COPY main.go ./
 
-# Build a static Linux binary for the requested architecture.
-#
-# CGO_ENABLED=0:
-#   creates a statically linked binary suitable for distroless/static.
-#
-# -trimpath:
-#   removes local build paths from the binary.
-#
-# -s -w:
-#   strips symbol/debug information to reduce binary size.
 RUN CGO_ENABLED=0 \
     GOOS=$TARGETOS \
     GOARCH=$TARGETARCH \
